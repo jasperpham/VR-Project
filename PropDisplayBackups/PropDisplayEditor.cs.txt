@@ -1,0 +1,149 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Text;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+[InitializeOnLoad]
+public static class PropDisplayEditor
+{
+    static string Root => Path.GetFullPath(".");
+    static string Cmd => "Library/PropDisplay.command";
+    static UnityEditor.PackageManager.Requests.AddRequest request;
+    static PropDisplayEditor() { EditorApplication.update += Tick; }
+    static void Tick()
+    {
+        if(request != null && request.IsCompleted) { File.WriteAllText("Library/PropDisplay.package.txt", request.Status + " " + request.Error?.message); request=null; }
+        if(EditorApplication.isCompiling || EditorApplication.isUpdating || !File.Exists(Cmd)) return;
+        var command=File.ReadAllText(Cmd).Trim(); File.Delete(Cmd);
+        try {
+            if(command=="package") request=UnityEditor.PackageManager.Client.Add("com.unity.cloud.gltfast");
+            if(command=="inspect") Inspect();
+            if(command=="build") Build();
+            if(command=="previews") Previews();
+            if(command=="refine") Refine();
+        } catch(Exception e) { File.WriteAllText("Library/PropDisplay.error.txt",e.ToString()); Debug.LogException(e); }
+    }
+    static Bounds BoundsOf(GameObject go) { var rr=go.GetComponentsInChildren<Renderer>().Where(r=>r.enabled).ToArray(); if(rr.Length==0)throw new Exception("No renderers: "+go.name); var b=rr[0].bounds; foreach(var r in rr.Skip(1))b.Encapsulate(r.bounds); return b; }
+    static void Inspect()
+    {
+        var s=new StringBuilder();
+        s.AppendLine("SCENE "+SceneManager.GetActiveScene().path);
+        foreach(var go in SceneManager.GetActiveScene().GetRootGameObjects()) { s.AppendLine(go.name+" position="+go.transform.position+" scale="+go.transform.localScale); }
+        foreach(var path in AssetDatabase.FindAssets("t:GameObject",new[]{"Assets/Props"}).Select(AssetDatabase.GUIDToAssetPath).Distinct()) {
+            var a=AssetDatabase.LoadAssetAtPath<GameObject>(path); if(!a)continue;
+            var go=UnityEngine.Object.Instantiate(a); var b=BoundsOf(go);
+            s.AppendLine("MODEL "+path+" bounds="+b+" rotation="+go.transform.eulerAngles);
+            foreach(var r in go.GetComponentsInChildren<Renderer>()) s.AppendLine("  "+r.name+" "+r.bounds+" materials="+string.Join(";",r.sharedMaterials.Select(m=>m?m.name+" ["+m.shader.name+"] color="+(m.HasProperty("_BaseColor")?m.GetColor("_BaseColor"):m.color):"NULL")));
+            UnityEngine.Object.DestroyImmediate(go);
+        }
+        File.WriteAllText("Library/PropDisplay.inspect.txt",s.ToString());
+    }
+    static Texture2D Tex(string path, bool normal=false, bool linear=false)
+    {
+        if(string.IsNullOrEmpty(path)) return null;
+        var imp=AssetImporter.GetAtPath(path) as TextureImporter;
+        if(imp!=null) { var type=normal?TextureImporterType.NormalMap:TextureImporterType.Default; if(imp.textureType!=type || imp.sRGBTexture==linear) { imp.textureType=type; imp.sRGBTexture=!linear; imp.SaveAndReimport(); } }
+        return AssetDatabase.LoadAssetAtPath<Texture2D>(path);
+    }
+    static Texture2D Raw(string path) { if(path==null)return null; var t=new Texture2D(2,2,TextureFormat.RGBA32,false,true); t.LoadImage(File.ReadAllBytes(path)); return t; }
+    static Texture2D Pack(string folder,string name,string metal,string rough,string ao=null,bool mra=false)
+    {
+        var m=Raw(metal);var r=Raw(rough);var a=Raw(ao);int n=1024;var t=new Texture2D(n,n,TextureFormat.RGBA32,false,true);var pixels=new Color32[n*n];
+        for(int y=0;y<n;y++)for(int x=0;x<n;x++) {float u=(x+.5f)/n,v=(y+.5f)/n;var mc=m?m.GetPixelBilinear(u,v):Color.black;var rc=r?r.GetPixelBilinear(u,v):new Color(.5f,.5f,.5f);pixels[y*n+x]=new Color(mc.r,mra?mc.b:a?a.GetPixelBilinear(u,v).r:1,0,1-(mra?mc.g:rc.r));}
+        t.SetPixels32(pixels);t.Apply();string p=folder+"/"+name+"_MetalSmooth.png";File.WriteAllBytes(p,t.EncodeToPNG());UnityEngine.Object.DestroyImmediate(t);if(m)UnityEngine.Object.DestroyImmediate(m);if(r)UnityEngine.Object.DestroyImmediate(r);if(a)UnityEngine.Object.DestroyImmediate(a);AssetDatabase.ImportAsset(p);return Tex(p,false,true);
+    }
+    static Material MaterialFor(string prop,string name,string prefix=null)
+    {
+        string root="Assets/Props/"+prop, dir=root+"/DisplayMaterials";Directory.CreateDirectory(dir);
+        var files=Directory.Exists(root+"/textures")?Directory.GetFiles(root+"/textures").Where(p=>!p.EndsWith(".meta")).Select(p=>p.Replace('\\','/')).ToArray():new string[0];
+        Func<string[],string> find=keys=>files.FirstOrDefault(p=>(prefix==null||Path.GetFileName(p).StartsWith(prefix,StringComparison.OrdinalIgnoreCase))&&keys.Any(k=>Path.GetFileNameWithoutExtension(p).IndexOf(k,StringComparison.OrdinalIgnoreCase)>=0));
+        var mat=new Material(Shader.Find("Universal Render Pipeline/Lit"));mat.name=name;mat.SetFloat("_Smoothness",.45f);
+        string bc=find(new[]{"BaseColor","albedo","_BC","Disc_1_Dark"}),norm=find(new[]{"Normal","_N"}),em=find(new[]{"Emissive","_E"}),met=find(new[]{"Metallic"}),rough=find(new[]{"Roughness"}),ao=find(new[]{"_AO","occlusion"}),mra=find(new[]{"_MRA"});
+        if(bc!=null)mat.SetTexture("_BaseMap",Tex(bc));
+        if(norm!=null) {mat.SetTexture("_BumpMap",Tex(norm,true,true));mat.EnableKeyword("_NORMALMAP");}
+        if(em!=null) {mat.SetTexture("_EmissionMap",Tex(em));mat.SetColor("_EmissionColor",Color.white);mat.EnableKeyword("_EMISSION");mat.globalIlluminationFlags=MaterialGlobalIlluminationFlags.BakedEmissive;}
+        if(met!=null||rough!=null||mra!=null) {mat.SetTexture("_MetallicGlossMap",Pack(dir,name,met??mra,rough,ao,mra!=null));mat.SetFloat("_Metallic",1);mat.SetFloat("_Smoothness",1);mat.EnableKeyword("_METALLICSPECGLOSSMAP");}
+        if(ao!=null){mat.SetTexture("_OcclusionMap",Tex(ao,false,true));mat.EnableKeyword("_OCCLUSIONMAP");}
+        if(mra!=null){mat.SetTexture("_OcclusionMap",mat.GetTexture("_MetallicGlossMap"));mat.EnableKeyword("_OCCLUSIONMAP");}
+        if(prop=="GoldenIdol") {mat.SetColor("_BaseColor",new Color(.83f,.53f,.16f));mat.SetFloat("_Metallic",.88f);mat.SetFloat("_Smoothness",.62f);}
+        if(prop=="TronDisc") {mat.SetColor("_EmissionColor",new Color(.1f,1.4f,2f));mat.SetFloat("_Metallic",.65f);}
+        if(prop=="Auto9"||prop=="ObiwanLightsaber") {string low=name.ToLowerInvariant();bool dark=low.Contains("black")||low.Contains("rubber");bool gold=low.Contains("gold")||low.Contains("brass");mat.SetColor("_BaseColor",dark?new Color(.025f,.03f,.035f):gold?new Color(.7f,.43f,.13f):new Color(.4f,.43f,.46f));mat.SetFloat("_Metallic",dark?.45f:.85f);mat.SetFloat("_Smoothness",dark?.35f:.65f);if(low.Contains("text")){mat.SetColor("_BaseColor",Color.white);mat.SetFloat("_Metallic",0);}}
+        if(prop=="ObiwanLightsaber" && name.ToLowerInvariant().Contains("copper"))mat.SetColor("_BaseColor",new Color(.72f,.34f,.12f));
+        if(prop=="ObiwanLightsaber" && name=="Blade"){mat.SetColor("_BaseColor",new Color(.15f,.65f,1));mat.SetFloat("_Metallic",0);mat.EnableKeyword("_EMISSION");mat.SetColor("_EmissionColor",new Color(.15f,1.8f,4));}
+        if(prop=="Auto9"&&name=="Material") {mat.SetColor("_BaseColor",new Color(.03f,.035f,.04f));mat.SetFloat("_Metallic",.25f);}
+        string path=dir+"/"+name.Replace('/','_').Replace('\\','_')+".mat";AssetDatabase.CreateAsset(mat,path);return mat;
+    }
+    static readonly string[] Props={"Deckardsblaster","Magnum44","ProtonPack","FluxCapacitor","MotionTracker","BarbasolCan","ObiwanLightsaber","TronDisc","GoldenIdol","Auto9"};
+    static readonly string[] Names={"Deckard Blaster",".44 Magnum","Proton Pack","Flux Capacitor","Alien Motion Tracker","Jurassic Park Barbasol Can","Obi-Wan Lightsaber","TRON Identity Disc","Golden Idol","RoboCop Auto-9"};
+    static void Build()
+    {
+        var scene=SceneManager.GetActiveScene();if(scene.path!="Assets/Scenes/SampleScene.unity")throw new Exception("Unexpected scene");
+        if(scene.GetRootGameObjects().Any(g=>g.name=="Movie Prop Displays"))throw new Exception("Displays already exist; refusing duplicate build");
+        var podiums=scene.GetRootGameObjects().Where(g=>g.name.StartsWith("Cube")&&Vector3.Distance(g.transform.localScale,Vector3.one)<.001f&&Mathf.Abs(g.transform.position.y-1)<.01f).OrderByDescending(g=>g.transform.position.z).ThenBy(g=>g.transform.position.x).ToArray();
+        if(podiums.Length!=10)throw new Exception("Expected ten podiums; found "+podiums.Length);
+        Directory.CreateDirectory("PropDisplayBackups");EditorSceneManager.SaveScene(scene,"PropDisplayBackups/SampleScene.before-props.unity",true);
+        var parent=new GameObject("Movie Prop Displays");Undo.RegisterCreatedObjectUndo(parent,"Place movie props");var report=new StringBuilder();
+        for(int i=0;i<Props.Length;i++) {
+            string prop=Props[i],root="Assets/Props/"+prop;
+            var path=Directory.GetFiles(root,"*",SearchOption.AllDirectories).Where(p=>new[]{".fbx",".obj",".glb",".gltf"}.Contains(Path.GetExtension(p).ToLowerInvariant())).Select(p=>p.Replace('\\','/')).FirstOrDefault(p=>AssetDatabase.LoadAssetAtPath<GameObject>(p));
+            if(path==null)throw new Exception("Model not imported: "+prop);
+            var model=AssetDatabase.LoadAssetAtPath<GameObject>(path);var display=new GameObject(Names[i]);var go=(GameObject)PrefabUtility.InstantiatePrefab(model);go.transform.SetParent(display.transform,false);
+            if(!path.EndsWith(".glb")&&!path.EndsWith(".gltf")) {
+                var cache=new System.Collections.Generic.Dictionary<string,Material>();
+                foreach(var renderer in go.GetComponentsInChildren<Renderer>()) {
+                    renderer.sharedMaterials=renderer.sharedMaterials.Select(old=> {string name=old?old.name:"Surface";if(!cache.ContainsKey(name))cache[name]=MaterialFor(prop,name,prop=="MotionTracker"?name:null);return cache[name];}).ToArray();
+                }
+            }
+            // Preserve imported geometry transforms; rotate the outer display only.
+            display.transform.rotation=Quaternion.Euler(0,i<5?180:0,0);
+            if(prop=="Magnum44")display.transform.rotation=Quaternion.Euler(0,260,0);
+            if(prop=="Auto9")display.transform.rotation=Quaternion.Euler(0,80,0);
+            if(prop=="FluxCapacitor")display.transform.rotation=Quaternion.Euler(0,-90,0);
+            if(prop=="ObiwanLightsaber")display.transform.rotation=Quaternion.Euler(0,0,80);
+            if(prop=="TronDisc")display.transform.rotation=Quaternion.Euler(55,0,0);
+            var b=BoundsOf(display);float maxHeight=prop=="ProtonPack"?1.1f:prop=="FluxCapacitor"?.95f:prop=="GoldenIdol"?.7f:prop=="BarbasolCan"?.65f:.8f;
+            if(prop=="ObiwanLightsaber")maxHeight=1.1f;
+            float scale=Mathf.Min(.82f/Mathf.Max(b.size.x,.0001f),.82f/Mathf.Max(b.size.z,.0001f),maxHeight/Mathf.Max(b.size.y,.0001f));display.transform.localScale=Vector3.one*scale;b=BoundsOf(display);
+            // Bake placement into the child so prefab roots remain centered at their base.
+            go.transform.position+=new Vector3(-b.center.x,-b.min.y,-b.center.z);
+            var prefabDir=root+"/Prefabs";Directory.CreateDirectory(prefabDir);var prefab=PrefabUtility.SaveAsPrefabAsset(display,prefabDir+"/"+prop+".prefab");UnityEngine.Object.DestroyImmediate(display);
+            display=(GameObject)PrefabUtility.InstantiatePrefab(prefab);display.name=Names[i];display.transform.SetParent(parent.transform,true);var top=BoundsOf(podiums[i]);display.transform.position=new Vector3(top.center.x,top.max.y+.004f,top.center.z);
+            b=BoundsOf(display);report.AppendLine(Names[i]+" | "+podiums[i].name+" | "+path+" | bounds="+b+" | base="+b.min.y);
+            foreach(var r in display.GetComponentsInChildren<Renderer>())foreach(var m in r.sharedMaterials)if(!m||!m.shader||!m.shader.isSupported)throw new Exception("Invalid material on "+Names[i]);
+        }
+        AssetDatabase.SaveAssets();EditorSceneManager.MarkSceneDirty(scene);EditorSceneManager.SaveScene(scene);File.WriteAllText("Library/PropDisplay.result.txt",report.ToString());Selection.activeGameObject=parent;
+        if(SceneView.lastActiveSceneView)SceneView.lastActiveSceneView.LookAt(new Vector3(0,1.6f,0),Quaternion.Euler(48,0,0),11);
+        Previews();
+    }
+    static void Previews()
+    {
+        Directory.CreateDirectory("Library/PropDisplayPreviews");var group=GameObject.Find("Movie Prop Displays");if(!group)return;
+        var camGo=new GameObject("Temporary prop verification camera");var cam=camGo.AddComponent<Camera>();cam.clearFlags=CameraClearFlags.SolidColor;cam.backgroundColor=new Color(.13f,.15f,.18f);cam.nearClipPlane=.01f;cam.farClipPlane=100;cam.fieldOfView=35;
+        var lightGo=new GameObject("Temporary prop verification light");var light=lightGo.AddComponent<Light>();light.type=LightType.Point;light.intensity=6;light.range=5;
+        var rt=new RenderTexture(720,720,24);cam.targetTexture=rt;
+        foreach(Transform child in group.transform){var b=BoundsOf(child.gameObject);float side=child.position.z>0?-1:1;cam.transform.position=b.center+new Vector3(.35f,.48f,side*1.8f);cam.transform.LookAt(b.center);light.transform.position=b.center+new Vector3(-.5f,1,side*1.0f);cam.Render();var old=RenderTexture.active;RenderTexture.active=rt;var tex=new Texture2D(720,720,TextureFormat.RGB24,false);tex.ReadPixels(new Rect(0,0,720,720),0,0);tex.Apply();File.WriteAllBytes("Library/PropDisplayPreviews/"+child.name.Replace('/','_')+".png",tex.EncodeToPNG());RenderTexture.active=old;UnityEngine.Object.DestroyImmediate(tex);}
+        cam.targetTexture=null;UnityEngine.Object.DestroyImmediate(rt);UnityEngine.Object.DestroyImmediate(camGo);UnityEngine.Object.DestroyImmediate(lightGo);File.WriteAllText("Library/PropDisplay.previews-done.txt","complete");
+    }
+    static void RotateDisplay(string name,Quaternion rotation)
+    {
+        var instance=GameObject.Find("Movie Prop Displays/"+name);var original=BoundsOf(instance);string path=PrefabUtility.GetPrefabAssetPathOfNearestInstanceRoot(instance);var prefab=PrefabUtility.LoadPrefabContents(path);
+        prefab.transform.rotation=rotation;var b=BoundsOf(prefab);prefab.transform.GetChild(0).position+=new Vector3(-b.center.x,-b.min.y,-b.center.z);PrefabUtility.SaveAsPrefabAsset(prefab,path);PrefabUtility.UnloadPrefabContents(prefab);
+        instance.transform.rotation=rotation;instance.transform.position=new Vector3(original.center.x,original.min.y,original.center.z);PrefabUtility.RecordPrefabInstancePropertyModifications(instance.transform);
+    }
+    static void Refine()
+    {
+        RotateDisplay("Proton Pack",Quaternion.identity);
+        RotateDisplay("Golden Idol",Quaternion.Euler(0,180,0));
+        var flux=GameObject.Find("Movie Prop Displays/Flux Capacitor");string path=PrefabUtility.GetPrefabAssetPathOfNearestInstanceRoot(flux);var prefab=PrefabUtility.LoadPrefabContents(path);
+        string matDir="Assets/Props/FluxCapacitor/DisplayMaterials";Directory.CreateDirectory(matDir);var glass=new Material(Shader.Find("Universal Render Pipeline/Lit"));glass.name="Clear Display Glass";glass.SetFloat("_Surface",1);glass.SetFloat("_Blend",0);glass.SetFloat("_SrcBlend",5);glass.SetFloat("_DstBlend",10);glass.SetFloat("_ZWrite",0);glass.SetFloat("_Smoothness",.9f);glass.SetFloat("_Metallic",0);glass.SetColor("_BaseColor",new Color(.8f,.9f,1,.09f));glass.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");glass.SetOverrideTag("RenderType","Transparent");glass.renderQueue=3000;AssetDatabase.CreateAsset(glass,matDir+"/ClearDisplayGlass.mat");
+        foreach(var r in prefab.GetComponentsInChildren<Renderer>().Where(r=>r.name.StartsWith("glass",StringComparison.OrdinalIgnoreCase)))r.sharedMaterials=r.sharedMaterials.Select(m=>glass).ToArray();
+        PrefabUtility.SaveAsPrefabAsset(prefab,path);PrefabUtility.UnloadPrefabContents(prefab);
+        AssetDatabase.SaveAssets();EditorSceneManager.SaveScene(SceneManager.GetActiveScene());Previews();
+        var report=new StringBuilder();foreach(Transform child in GameObject.Find("Movie Prop Displays").transform){var b=BoundsOf(child.gameObject);report.AppendLine(child.name+" center="+b.center+" size="+b.size+" bottom="+b.min.y);}
+        File.WriteAllText("Library/PropDisplay.final.txt",report.ToString());
+    }
+}
